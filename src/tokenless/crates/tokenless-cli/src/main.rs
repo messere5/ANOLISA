@@ -451,6 +451,24 @@ fn open_recorder_with(paths: &DatabasePathResolver) -> Result<StatsRecorder, (St
     StatsRecorder::new(db_path).map_err(|e| (format!("Failed to open database: {e}"), 1))
 }
 
+/// Open the stats recorder for a fail-soft path, warning when stats are
+/// enabled but the recorder cannot be opened. The fail-soft contract (PR
+/// #3587) makes every lost stats or retrieval-event write audible on stderr
+/// while the command itself continues; an unopenable database (held by a
+/// backup, a migration, another process's `BEGIN EXCLUSIVE`) is such a loss,
+/// not a reason to fail the compression or the retrieval.
+fn open_recorder_or_warn(paths: &DatabasePathResolver) -> Option<StatsRecorder> {
+    match open_recorder_with(paths) {
+        Ok(recorder) => Some(recorder),
+        Err((message, _)) => {
+            warn_stats(&format!(
+                "[tokenless-stats] WARNING: failed to open stats recorder: {message}"
+            ));
+            None
+        }
+    }
+}
+
 /// Best-effort stderr warning whose own write failure cannot fail the
 /// command. `eprintln!` panics when writing to stderr fails (a full
 /// filesystem behind redirected logs), which turned the fail-soft stats
@@ -568,7 +586,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 .transpose()
                 .map_err(|error| (error, 1))?;
             let recorder = if config.is_stats_enabled() {
-                open_recorder_with(&database_paths).ok()
+                open_recorder_or_warn(&database_paths)
             } else {
                 None
             };
@@ -810,9 +828,10 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 }
             };
             // Retrieve events are attribution, never a gate: a recorder that
-            // fails to open degrades to unrecorded retrieval.
+            // fails to open degrades to unrecorded retrieval — audibly, per
+            // the fail-soft contract of PR #3587.
             let recorder = if TokenlessConfig::load().is_stats_enabled() {
-                open_recorder_with(&DatabasePathResolver::default()).ok()
+                open_recorder_or_warn(&DatabasePathResolver::default())
             } else {
                 None
             };
@@ -1291,12 +1310,13 @@ fn record_compression_stats(
         .with_mode(mode)
         .with_stash(stash_writes, stash_errors, stash_size);
 
-    // SQLite stats recording — gated by stats_enabled. The warning is
+    // SQLite stats recording — gated by stats_enabled. The warnings are
     // best-effort: a failed stderr write (full filesystem behind
     // redirected logs) must not turn a fail-soft stats miss into a
-    // failed compression command.
+    // failed compression command, and a recorder that cannot be opened
+    // is an audible loss (issue #7285), not a silent one.
     if config.is_stats_enabled()
-        && let Ok(recorder) = open_recorder_with(database_paths)
+        && let Some(recorder) = open_recorder_or_warn(database_paths)
         && let Err(e) = recorder.record(&record)
     {
         warn_stats(&format!(
