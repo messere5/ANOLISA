@@ -6,6 +6,7 @@ use fuser::{FUSE_ROOT_ID, FileType, ReplyDirectory, ReplyEmpty, ReplyOpen, Reque
 use tracing::{debug, warn};
 
 use super::super::SkillFs;
+use super::super::paths::FlatLiveDirKind;
 use super::super::read_resolution::ReadResolution;
 use crate::attr::dir_entry_file_type;
 use crate::path::{PathType, is_skill_discover_path};
@@ -298,6 +299,14 @@ impl SkillFs {
                             || self.is_pending_install(&skill_name)
                         {
                             self.source_base().join(&skill_name)
+                        } else if self.is_post_publish_grace_allowed(
+                            &skill_name,
+                            Some(relative_path.as_path()),
+                        ) {
+                            // I4: grace bypass — whitelisted paths enumerate
+                            // from the live source, matching lookup/getattr/
+                            // access/open and the nested layout's dir listings.
+                            self.flat_live_dir(&skill_name, FlatLiveDirKind::ExistingSkill)
                         } else {
                             match self.skill_read_dir(&skill_name) {
                                 Some(d) => d,
@@ -995,6 +1004,14 @@ impl SkillFs {
                             || self.is_pending_install(skill_name)
                         {
                             self.source_base().join(skill_name)
+                        } else if self.is_post_publish_grace_allowed(
+                            skill_name,
+                            Some(relative_path.as_path()),
+                        ) {
+                            // I4: grace bypass — whitelisted paths enumerate
+                            // from the live source, matching lookup/getattr/
+                            // access/open and the nested layout's dir listings.
+                            self.flat_live_dir(skill_name, FlatLiveDirKind::ExistingSkill)
                         } else {
                             match self.skill_read_dir(skill_name) {
                                 Some(d) => d,

@@ -2333,6 +2333,54 @@ fn post_publish_grace_readdir_does_not_list_hidden_skill_contents() {
 }
 
 #[test]
+fn post_publish_grace_hidden_whitelisted_dir_lists_during_grace() {
+    skip_if_no_fuse!();
+
+    // Staging-rename flow: the published skill has no activation (hidden),
+    // so only the grace window lets the installer reach whitelisted paths.
+    let fixture = PostPublishFixture::new(5000, |src| {
+        create_skill(src, "existing");
+    });
+
+    let staging = fixture.skill_path(".openclaw-install-stage-lsdir");
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::write(
+        staging.join("SKILL.md"),
+        "---\nname: lsdir\ndescription: test\n---\n",
+    )
+    .unwrap();
+
+    let final_path = fixture.skill_path("lsdir");
+    std::fs::rename(&staging, &final_path).unwrap();
+    fixture.wait_for_notify(1);
+
+    // Grace-authorized installer writes into the whitelisted directory.
+    std::fs::create_dir(final_path.join(".openclaw")).unwrap();
+    std::fs::write(final_path.join(".openclaw/meta.json"), "{}").unwrap();
+
+    // Exact-path reads succeed through the grace bypass (lookup/getattr/open
+    // already honor grace)...
+    let content = std::fs::read_to_string(final_path.join(".openclaw/meta.json")).unwrap();
+    assert_eq!(content, "{}");
+
+    // ...so enumerating that same directory must succeed too instead of
+    // ENOENT from the hidden-skill view: readdir/opendir ignored grace.
+    let entries = common::list_dir_names(&final_path.join(".openclaw"));
+    assert!(
+        entries.contains(&"meta.json".to_string()),
+        "readdir of the grace-whitelisted dir must honor grace: {:?}",
+        entries
+    );
+
+    // The hidden skill root itself keeps its carve-out: it must stay
+    // unlistable during grace.
+    assert!(
+        std::fs::read_dir(&final_path).is_err(),
+        "readdir on the hidden skill root must still fail during grace"
+    );
+}
+
+#[test]
 fn post_publish_grace_non_whitelisted_file_read_rejected() {
     skip_if_no_fuse!();
 
@@ -2848,6 +2896,77 @@ fn post_publish_grace_fallback_readdir_does_not_leak_source() {
         !entries.contains(&"extra".to_string()),
         "readdir must not expose extra/ from physical source during grace: {:?}",
         entries
+    );
+}
+
+#[test]
+fn post_publish_grace_fallback_whitelisted_dir_lists_live_source() {
+    skip_if_no_fuse!();
+
+    let fixture = FallbackGraceFixture::new(5000, |src, snapshot| {
+        // Physical source has the skill with .clawhub and a non-whitelisted dir
+        let skill = src.join("fallback-skill");
+        std::fs::create_dir_all(skill.join(".clawhub")).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: fallback-skill\ndescription: test\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill.join(".clawhub/origin.json"),
+            r#"{"origin":"installer"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(skill.join("data")).unwrap();
+        std::fs::write(skill.join("data/secret.txt"), "secret").unwrap();
+
+        // Snapshot does NOT contain .clawhub — only SKILL.md
+        std::fs::write(
+            snapshot.join("SKILL.md"),
+            "---\nname: fallback-skill\ndescription: snapshot\n---\n",
+        )
+        .unwrap();
+    });
+
+    fixture
+        .post_publish_controller
+        .start_session("fallback-skill", PostPublishSessionKind::StagingRename);
+
+    let skill_via_fuse = fixture.skill_path();
+
+    // Cross-surface agreement: the whitelisted file is stat-able and readable
+    // from the live source (lookup/getattr/open honor grace today).
+    let whitelisted = skill_via_fuse.join(".clawhub/origin.json");
+    assert!(
+        std::fs::metadata(&whitelisted).is_ok(),
+        "stat of grace-whitelisted path must serve the live source"
+    );
+    let content = std::fs::read_to_string(&whitelisted).unwrap();
+    assert_eq!(content, r#"{"origin":"installer"}"#);
+
+    // readdir/opendir of the whitelisted directory must enumerate the live
+    // source too — not the snapshot view, which has no .clawhub and reports
+    // an empty directory while stat/open succeed on its children.
+    let entries = common::list_dir_names(&skill_via_fuse.join(".clawhub"));
+    assert!(
+        entries.contains(&"origin.json".to_string()),
+        "readdir of the grace-whitelisted dir must list the live source: {:?}",
+        entries
+    );
+
+    // The skill-root listing keeps its carve-out: source-only directories
+    // stay out of the snapshot-driven root listing.
+    let root_entries = common::list_dir_names(&skill_via_fuse);
+    assert!(
+        !root_entries.contains(&".clawhub".to_string()),
+        "skill-root readdir must not leak source-only dirs during grace: {:?}",
+        root_entries
+    );
+
+    // Non-whitelisted source-only files stay hidden behind the snapshot view.
+    assert!(
+        std::fs::metadata(skill_via_fuse.join("data/secret.txt")).is_err(),
+        "non-whitelisted source-only file must stay hidden during grace"
     );
 }
 
